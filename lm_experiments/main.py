@@ -19,9 +19,10 @@ from blocks.algorithms import GradientDescent, Scale, Adam
 from blocks.initialization import Orthogonal, IsotropicGaussian, Constant
 from blocks.model import Model
 from blocks.monitoring import aggregation
-from blocks.extensions import FinishAfter, Printing
+from blocks.extensions import FinishAfter, Printing, Timing
 from blocks.extensions.saveload import Checkpoint
-from blocks.extensions.monitoring import TrainingDataMonitoring
+from blocks.extensions.monitoring import (TrainingDataMonitoring,
+                                          DataStreamMonitoring)
 from blocks.serialization import load, load_parameter_values
 from blocks.main_loop import MainLoop
 from blocks.select import Selector
@@ -46,25 +47,32 @@ def _truncate(data):
 
 def main(mode, save_path, steps, num_batches):
     with open('/Tmp/serdyuk/data/wsj_text/wordlist.pkl') as f:
-        dictionary = cPickle.load(f)
-    chars = list(string.ascii_uppercase) + list(range(10)) + [' ', '.', ',', '<UNK>']
-    dictionary = {char: i for i, char in enumerate(chars)}
-    dataset = TextFile(['/Tmp/serdyuk/data/wsj_text/train_nounk'], 
-                       dictionary, bos_token=None, eos_token=None, level='character')
-    vocab_size = len(dictionary)
+        char_to_ind = cPickle.load(f)
+    chars = list(string.ascii_uppercase) + list(range(10)) + [' ', '.', ',',
+                                                              '<UNK>']
+    char_to_ind = {char: i for i, char in enumerate(chars)}
+    ind_to_char = {v: k for k, v in char_to_ind.iteritems()}
+
+    train_dataset = TextFile(['/Tmp/serdyuk/data/wsj_text/train_subset'],
+                             char_to_ind, bos_token=None, eos_token=None,
+                             level='character')
+    valid_dataset = TextFile(['/Tmp/serdyuk/data/wsj_text/valid_subset'],
+                             char_to_ind, bos_token=None, eos_token=None,
+                             level='character')
+
+    vocab_size = len(char_to_ind)
     logger.info('Dictionary size: {}'.format(vocab_size))
 
     if mode == "train":
         # Experiment configuration
-        rng = numpy.random.RandomState(1123)
         batch_size = 100
         dim = 700
         feedback_dim = 700
 
         # Build the bricks and initialize them
 
-        transition = LSTM(name="transition", dim=dim,
-                activation=Tanh())
+        transition = GatedRecurrent(name="transition", dim=dim,
+                                    activation=Tanh())
         generator = SequenceGenerator(
             Readout(readout_dim=vocab_size, source_names=["states"],
                     emitter=SoftmaxEmitter(name="emitter"),
@@ -103,6 +111,8 @@ def main(mode, save_path, steps, num_batches):
         char_cost.name = 'character_log_likelihood'
         ppl = 2 ** char_cost
         ppl.name = 'ppl'
+        bits_per_char = char_cost / tensor.log(2)
+        bits_per_char.name = 'bits_per_char'
         length = features.shape[0]
         length.name = 'length'
 
@@ -110,26 +120,41 @@ def main(mode, save_path, steps, num_batches):
             cost=cost,
             parameters=list(Selector(generator).get_parameters().values()),
             step_rule=Adam(0.0001))
-        data_stream = dataset.get_example_stream()
-        data_stream = Mapping(data_stream, _truncate)
-        data_stream = Batch(data_stream, iteration_scheme=ConstantScheme(batch_size))
-        data_stream = Padding(data_stream)
-        data_stream = Mapping(data_stream, _transpose)
+        train_stream = train_dataset.get_example_stream()
+        train_stream = Mapping(train_stream, _truncate)
+        train_stream = Batch(train_stream,
+                             iteration_scheme=ConstantScheme(batch_size))
+        train_stream = Padding(train_stream)
+        train_stream = Mapping(train_stream, _transpose)
+
+        valid_stream = valid_dataset.get_example_stream()
+        valid_stream = Batch(valid_stream,
+                             iteration_scheme=ConstantScheme(batch_size))
+        valid_stream = Padding(valid_stream)
+        valid_stream = Mapping(valid_stream, _transpose)
+
         params = load_parameter_values(save_path)
         model = Model(cost)
-        #model.set_parameter_values(params)
+        model.set_parameter_values(params)
         ft = features[:6, 0]
         ft.name = 'feature_example'
+
+        observables = [cost, ppl, char_cost, length, bits_per_char]
         main_loop = MainLoop(
             algorithm=algorithm,
-            data_stream=data_stream,
+            data_stream=train_stream,
             model=model,
             extensions=[FinishAfter(after_n_batches=num_batches),
-                TrainingDataMonitoring([cost, ppl, char_cost, length, ft], prefix="this_step",
-                                               after_batch=True),
-                        TrainingDataMonitoring([cost, ppl, char_cost, length], prefix="average",
-                                               every_n_batches=100),
+                        TrainingDataMonitoring(
+                            observables + [ft], prefix="this_step", after_batch=True),
+                        TrainingDataMonitoring(
+                            observables, prefix="average",
+                            every_n_batches=100),
+                        DataStreamMonitoring(
+                            observables, prefix="valid",
+                            every_n_batches=500, data_stream=valid_stream),
                         Checkpoint(save_path, every_n_batches=500),
+                        Timing(after_batch=True),
                         Printing(every_n_batches=100)])
         main_loop.run()
     elif mode == "sample":
@@ -140,8 +165,7 @@ def main(mode, save_path, steps, num_batches):
             n_steps=steps, batch_size=1, iterate=True)).get_theano_function()
 
         states, outputs, costs = [data[:, 0] for data in sample()]
-        rev_dict = {v: k for k, v in dictionary.iteritems()}
-        print("".join([rev_dict[s] for s in outputs]))
+        print("".join([ind_to_char[s] for s in outputs]))
 
         numpy.set_printoptions(precision=3, suppress=True)
         print("Generation cost:\n{}".format(costs.sum()))
