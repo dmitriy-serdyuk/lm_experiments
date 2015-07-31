@@ -3,6 +3,7 @@ from __future__ import print_function
 import argparse
 import logging
 import pprint
+import os
 import sys
 import string
 
@@ -12,23 +13,25 @@ import theano
 from theano import tensor
 
 from blocks.bricks import Tanh
-from blocks.bricks.recurrent import GatedRecurrent, LSTM
+from blocks.bricks.recurrent import GatedRecurrent
 from blocks.bricks.sequence_generators import (
     SequenceGenerator, Readout, SoftmaxEmitter, LookupFeedback)
 from blocks.graph import ComputationGraph
-from blocks.algorithms import GradientDescent, Scale, Adam
+from blocks.algorithms import GradientDescent, Adam
 from blocks.initialization import Orthogonal, IsotropicGaussian, Constant
 from blocks.model import Model
 from blocks.monitoring import aggregation
-from blocks.extensions import FinishAfter, Printing, Timing
-from blocks.extensions.saveload import Checkpoint
+from blocks.extensions import Printing, Timing
 from blocks.extensions.monitoring import (TrainingDataMonitoring,
                                           DataStreamMonitoring)
+from blocks.extensions.predicates import OnLogRecord
+from blocks.extensions.saveload import Checkpoint
+from blocks.extensions.training import TrackTheBest
+from blocks.extras.extensions.plot import Plot
 from blocks.serialization import load, load_parameter_values, continue_training
 from blocks.main_loop import MainLoop
 from blocks.select import Selector
 from fuel.datasets import TextFile
-from fuel.streams import DataStream
 from fuel.schemes import ConstantScheme, ShuffledScheme
 from fuel.transformers import Batch, Padding, Mapping, Unpack
 
@@ -51,7 +54,7 @@ def _truncate(data):
     return data[0][ind: (ind + max_length)],
 
 
-def main(mode, save_path, steps, num_batches):
+def main(mode, save_path, steps, num_batches, load_params):
     with open('/Tmp/serdyuk/data/wsj_text/wordlist.pkl') as f:
         char_to_ind = cPickle.load(f)
     chars = (list(string.ascii_uppercase) + list(range(10)) +
@@ -127,9 +130,9 @@ def main(mode, save_path, steps, num_batches):
         algorithm = GradientDescent(
             cost=cost,
             parameters=list(Selector(generator).get_parameters().values()),
-            step_rule=Adam(0.0001))
+            step_rule=Adam(0.0002))
         train_stream = train_dataset.get_example_stream()
-        train_stream = Mapping(train_stream, _truncate)
+        #train_stream = Mapping(train_stream, _truncate)
         train_stream = Batch(train_stream,
                              iteration_scheme=ConstantScheme(batch_size))
         train_stream = Padding(train_stream)
@@ -142,30 +145,57 @@ def main(mode, save_path, steps, num_batches):
         valid_stream = Padding(valid_stream)
         valid_stream = Mapping(valid_stream, _transpose)
 
-        #params = load_parameter_values(save_path)
         model = Model(cost)
-        #model.set_parameter_values(params)
+        if load_params:
+            params = load_parameter_values(save_path)
+            model.set_parameter_values(params)
         ft = features[:6, 0]
         ft.name = 'feature_example'
 
         observables = [cost, ppl, char_cost, length, bits_per_char]
+        track_the_best_bpc = TrackTheBest('valid_bits_per_char')
+        root_path, extension = os.path.splitext(save_path)
+
+        this_step_monitoring = TrainingDataMonitoring(
+            observables + [ft], prefix="this_step", after_batch=True)
+        average_monitoring = TrainingDataMonitoring(
+            observables, prefix="average",
+            every_n_batches=100)
+        valid_monitoring = DataStreamMonitoring(
+            observables, prefix="valid",
+            every_n_batches=1000, before_training=False,
+            data_stream=valid_stream)
         main_loop = MainLoop(
             algorithm=algorithm,
             data_stream=train_stream,
             model=model,
-            extensions=[FinishAfter(after_n_batches=num_batches),
-                        TrainingDataMonitoring(
-                            observables + [ft], prefix="this_step", after_batch=True),
-                        TrainingDataMonitoring(
-                            observables, prefix="average",
-                            every_n_batches=100),
-                        DataStreamMonitoring(
-                            observables, prefix="valid",
-                            every_n_batches=500, before_training=False,
-                            data_stream=valid_stream),
-                        Checkpoint(save_path, every_n_batches=500),
-                        Timing(after_batch=True),
-                        Printing(every_n_batches=100)])
+            extensions=[
+                this_step_monitoring,
+                average_monitoring,
+                valid_monitoring,
+                track_the_best_bpc,
+                Checkpoint(save_path, ),
+                Checkpoint(save_path,
+                           every_n_batches=500,
+                           save_separately=["model", "log"],
+                           use_cpickle=True)
+                    .add_condition(
+                    ['after_epoch'],
+                    OnLogRecord(track_the_best_bpc.notification_name),
+                    (root_path + "_best" + extension,)),
+                Timing(after_batch=True),
+                Printing(every_n_batches=100),
+                Plot(root_path,
+                     [[average_monitoring.record_name(cost),
+                       valid_monitoring.record_name(cost)],
+                      [average_monitoring.record_name(ppl),
+                       valid_monitoring.record_name(ppl)],
+                      [average_monitoring.record_name(char_cost),
+                       valid_monitoring.record_name(char_cost)],
+                      [average_monitoring.record_name(bits_per_char),
+                       valid_monitoring.record_name(bits_per_char)]],
+                     every_n_batches=100)
+            ])
         main_loop.run()
     elif mode == "sample":
         main_loop = load(open(save_path, "rb"))
@@ -212,5 +242,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-batches", default=10000, type=int,
         help="Train on this many batches.")
+    parser.add_argument(
+        "--load-params", action='store_true', default=False,
+        help="Load parameters.")
     args = parser.parse_args()
     main(**vars(args))
