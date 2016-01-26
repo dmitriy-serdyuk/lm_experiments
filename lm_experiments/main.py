@@ -72,6 +72,35 @@ def main(mode, save_path, steps, num_batches, load_params):
 
     vocab_size = len(char_to_ind)
     logger.info('Dictionary size: {}'.format(vocab_size))
+    if mode == 'continue':
+        continue_training(save_path)
+        return
+    elif mode == "sample":
+        main_loop = load(open(save_path, "rb"))
+        generator = main_loop.model.get_top_bricks()[-1]
+
+        sample = ComputationGraph(generator.generate(
+            n_steps=steps, batch_size=1, iterate=True)).get_theano_function()
+
+        states, outputs, costs = [data[:, 0] for data in sample()]
+        print("".join([ind_to_char[s] for s in outputs]))
+
+        numpy.set_printoptions(precision=3, suppress=True)
+        print("Generation cost:\n{}".format(costs.sum()))
+
+        freqs = numpy.bincount(outputs).astype(floatX)
+        freqs /= freqs.sum()
+
+        trans_freqs = numpy.zeros((vocab_size, vocab_size), dtype=floatX)
+        for a, b in zip(outputs, outputs[1:]):
+            trans_freqs[a, b] += 1
+        trans_freqs /= trans_freqs.sum(axis=1)[:, None]
+        return
+
+    # Experiment configuration
+    batch_size = 20
+    dim = 650
+    feedback_dim = 700
 
     valid_stream = valid_dataset.get_example_stream()
     valid_stream = Batch(valid_stream,
@@ -79,61 +108,55 @@ def main(mode, save_path, steps, num_batches, load_params):
     valid_stream = Padding(valid_stream)
     valid_stream = Mapping(valid_stream, _transpose)
 
-    if mode == 'continue':
-        continue_training(save_path)
-    elif mode == "train":
-        # Experiment configuration
-        batch_size = 20
-        dim = 650
-        feedback_dim = 700
+    # Build the bricks and initialize them
 
-        # Build the bricks and initialize them
+    transition = GatedRecurrent(name="transition", dim=dim,
+                                activation=Tanh())
+    generator = SequenceGenerator(
+        Readout(readout_dim=vocab_size, source_names=transition.apply.states,
+                emitter=SoftmaxEmitter(name="emitter"),
+                feedback_brick=LookupFeedback(
+                    vocab_size, feedback_dim, name='feedback'),
+                name="readout"),
+        transition,
+        weights_init=Uniform(std=0.04), biases_init=Constant(0),
+        name="generator")
+    generator.push_initialization_config()
+    transition.weights_init = Orthogonal()
+    transition.push_initialization_config()
+    generator.initialize()
 
-        transition = GatedRecurrent(name="transition", dim=dim,
-                                    activation=Tanh())
-        generator = SequenceGenerator(
-            Readout(readout_dim=vocab_size, source_names=transition.apply.states,
-                    emitter=SoftmaxEmitter(name="emitter"),
-                    feedback_brick=LookupFeedback(
-                        vocab_size, feedback_dim, name='feedback'),
-                    name="readout"),
-            transition,
-            weights_init=Uniform(std=0.04), biases_init=Constant(0),
-            name="generator")
-        generator.push_initialization_config()
-        transition.weights_init = Orthogonal()
-        transition.push_initialization_config()
-        generator.initialize()
+    # Build the cost computation graph.
+    features = tensor.lmatrix('features')
+    features_mask = tensor.matrix('features_mask')
+    batch_cost = generator.cost_matrix(
+        features, mask=features_mask).sum()
+    cost = aggregation.mean(
+        batch_cost,
+        features.shape[1])
+    cost.name = "sequence_log_likelihood"
+    char_cost = aggregation.mean(
+        batch_cost, features_mask.sum())
+    char_cost.name = 'character_log_likelihood'
+    ppl = 2 ** (cost / numpy.log(2))
+    ppl.name = 'ppl'
+    bits_per_char = char_cost / tensor.log(2)
+    bits_per_char.name = 'bits_per_char'
+    length = features.shape[0]
+    length.name = 'length'
 
+    model = Model(batch_cost)
+    if load_params:
+        params = load_parameter_values(save_path)
+        model.set_parameter_values(params)
+
+    if mode == "train":
         # Give an idea of what's going on.
         logger.info("Parameters:\n" +
                     pprint.pformat(
                         [(key, value.get_value().shape) for key, value
                          in Selector(generator).get_parameters().items()],
                         width=120))
-        #logger.info("Markov chain entropy: {}".format(
-        #    MarkovChainDataset.entropy))
-        #logger.info("Expected min error: {}".format(
-        #    -MarkovChainDataset.entropy * seq_len))
-
-        # Build the cost computation graph.
-        features = tensor.lmatrix('features')
-        features_mask = tensor.matrix('features_mask')
-        batch_cost = generator.cost_matrix(
-                features, mask=features_mask).sum()
-        cost = aggregation.mean(
-            batch_cost,
-            features.shape[1])
-        cost.name = "sequence_log_likelihood"
-        char_cost = aggregation.mean(
-                batch_cost, features_mask.sum())
-        char_cost.name = 'character_log_likelihood'
-        ppl = 2 ** (cost / numpy.log(2))
-        ppl.name = 'ppl'
-        bits_per_char = char_cost / tensor.log(2)
-        bits_per_char.name = 'bits_per_char'
-        length = features.shape[0]
-        length.name = 'length'
 
         train_stream = train_dataset.get_example_stream()
         train_stream = Mapping(train_stream, _truncate)
@@ -142,28 +165,14 @@ def main(mode, save_path, steps, num_batches, load_params):
         train_stream = Padding(train_stream)
         train_stream = Mapping(train_stream, _transpose)
 
-        for i, batch in enumerate(train_stream.get_epoch_iterator()):
-            break
-            if i > 58:
-                break
-            print(batch)
-            print("".join([ind_to_char[ind] for ind in batch[0][:, 0]]))
-        # ---------------------------------------------------------------------
-
-
-        model = Model(batch_cost)
-
         parameters = model.get_parameter_dict()
         maxnorm_subjects = VariableFilter(roles=[WEIGHT])(parameters.values())
         algorithm = GradientDescent(
             cost=batch_cost,
             parameters=parameters.values(),
             step_rule=CompositeRule([StepClipping(1000.), 
-                AdaDelta(epsilon=1e-10) #, Restrict(VariableClipping(1.0, axis=0), maxnorm_subjects)
+                AdaDelta(epsilon=1e-8) #, Restrict(VariableClipping(1.0, axis=0), maxnorm_subjects)
                                      ]))
-        if load_params:
-            params = load_parameter_values(save_path)
-            model.set_parameter_values(params)
         ft = features[:6, 0]
         ft.name = 'feature_example'
 
@@ -224,36 +233,14 @@ def main(mode, save_path, steps, num_batches, load_params):
                      every_n_batches=10)
             ])
         main_loop.run()
-    elif mode == "sample":
-        main_loop = load(open(save_path, "rb"))
-        generator = main_loop.model.get_top_bricks()[-1]
-
-        sample = ComputationGraph(generator.generate(
-            n_steps=steps, batch_size=1, iterate=True)).get_theano_function()
-
-        states, outputs, costs = [data[:, 0] for data in sample()]
-        print("".join([ind_to_char[s] for s in outputs]))
-
-        numpy.set_printoptions(precision=3, suppress=True)
-        print("Generation cost:\n{}".format(costs.sum()))
-
-        freqs = numpy.bincount(outputs).astype(floatX)
-        freqs /= freqs.sum()
-
-        trans_freqs = numpy.zeros((vocab_size, vocab_size), dtype=floatX)
-        for a, b in zip(outputs, outputs[1:]):
-            trans_freqs[a, b] += 1
-        trans_freqs /= trans_freqs.sum(axis=1)[:, None]
 
     elif mode == 'evaluate':
-        main_loop = load(open(save_path, "rb"))
-        generator = main_loop.model.get_top_bricks()[-1]
+        compute_cost = theano.function([features, features_mask], batch_cost)
 
-        sample = ComputationGraph(generator.generate(
-            n_steps=steps, batch_size=1, iterate=True)).get_theano_function()
-        batch_cost = generator.cost_matrix(
-                features, mask=features_mask).sum()
-        
+        for batch in valid_stream.get_epoch_iterator():
+            for example in batch.T:
+                cost = compute_cost(example[:, None])
+                print(cost)
     else:
         assert False
 
