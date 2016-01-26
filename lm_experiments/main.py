@@ -7,10 +7,11 @@ import os
 import sys
 import string
 
-from six.moves import cPickle
 import numpy
 import theano
 from theano import tensor
+
+from picklable_itertools.extras import equizip
 
 from blocks.bricks import Tanh
 from blocks.bricks.recurrent import GatedRecurrent
@@ -235,12 +236,28 @@ def main(mode, save_path, steps, num_batches, load_params):
         main_loop.run()
 
     elif mode == 'evaluate':
+        words = []
         compute_cost = theano.function([features, features_mask], batch_cost)
 
+        total_word_cost = 0
+        num_words = 0
         for batch in valid_stream.get_epoch_iterator():
             for example in batch.T:
-                cost = compute_cost(example[:, None])
-                print(cost)
+                spc_inds, = numpy.where(example == char_to_ind[" "])
+                for i, j in equizip([0] + spc_inds, spc_inds + [-1]):
+                    cost_without = compute_cost(example[:i, None])
+                    cost_with = compute_cost(example[:j, None])
+                    costs = []
+                    for word in words:
+                        costs.append(numpy.exp(-compute_cost(
+                            numpy.concatenate([example[:i], word])[:, None])))
+                    word_prob = numpy.exp(-(cost_with - cost_without))
+                    total_word_cost += numpy.log(word_prob / numpy.sum(costs))
+                    num_words += 1
+                    print(word_prob)
+
+        print("Word-level perplexity")
+        print(total_word_cost / num_words)
     else:
         assert False
 
