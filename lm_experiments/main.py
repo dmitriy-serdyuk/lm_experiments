@@ -17,9 +17,12 @@ from blocks.bricks.recurrent import GatedRecurrent
 from blocks.bricks.sequence_generators import (
     SequenceGenerator, Readout, SoftmaxEmitter, LookupFeedback)
 from blocks.graph import ComputationGraph
-from blocks.algorithms import GradientDescent, Adam
+from blocks.algorithms import GradientDescent, Adam, CompositeRule, StepClipping, AdaDelta, Momentum, Restrict, VariableClipping
 from blocks.initialization import Orthogonal, IsotropicGaussian, Constant
+from blocks.filter import VariableFilter
 from blocks.model import Model
+from blocks.roles import WEIGHT
+from blocks.initialization import Uniform
 from blocks.monitoring import aggregation
 from blocks.extensions import Printing, Timing
 from blocks.extensions.monitoring import (TrainingDataMonitoring,
@@ -27,7 +30,7 @@ from blocks.extensions.monitoring import (TrainingDataMonitoring,
 from blocks.extensions.predicates import OnLogRecord
 from blocks.extensions.saveload import Checkpoint
 from blocks.extensions.training import TrackTheBest
-from blocks.extras.extensions.plot import Plot
+from blocks_extras.extensions.plot import Plot
 from blocks.serialization import load, load_parameter_values, continue_training
 from blocks.main_loop import MainLoop
 from blocks.select import Selector
@@ -46,7 +49,7 @@ def _transpose(data):
 
 
 def _truncate(data):
-    max_length = 150
+    max_length = 100
     length = len(data[0])
     if length <= max_length:
         return data
@@ -55,29 +58,33 @@ def _truncate(data):
 
 
 def main(mode, save_path, steps, num_batches, load_params):
-    with open('/Tmp/serdyuk/data/wsj_text/wordlist.pkl') as f:
-        char_to_ind = cPickle.load(f)
     chars = (list(string.ascii_uppercase) + list(range(10)) +
              [' ', '.', ',', '\'', '"', '!', '?', '<UNK>'])
     char_to_ind = {char: i for i, char in enumerate(chars)}
     ind_to_char = {v: k for k, v in char_to_ind.iteritems()}
 
-    train_dataset = TextFile(['/Tmp/serdyuk/data/wsj_text/train_subset'],
+    train_dataset = TextFile(['/Tmp/serdyuk/data/wsj_text_train'],
                              char_to_ind, bos_token=None, eos_token=None,
                              level='character')
-    valid_dataset = TextFile(['/Tmp/serdyuk/data/wsj_text/valid_subset'],
+    valid_dataset = TextFile(['/Tmp/serdyuk/data/wsj_text_valid'],
                              char_to_ind, bos_token=None, eos_token=None,
                              level='character')
 
     vocab_size = len(char_to_ind)
     logger.info('Dictionary size: {}'.format(vocab_size))
 
+    valid_stream = valid_dataset.get_example_stream()
+    valid_stream = Batch(valid_stream,
+                         iteration_scheme=ConstantScheme(batch_size))
+    valid_stream = Padding(valid_stream)
+    valid_stream = Mapping(valid_stream, _transpose)
+
     if mode == 'continue':
         continue_training(save_path)
     elif mode == "train":
         # Experiment configuration
-        batch_size = 100
-        dim = 700
+        batch_size = 20
+        dim = 650
         feedback_dim = 700
 
         # Build the bricks and initialize them
@@ -85,16 +92,17 @@ def main(mode, save_path, steps, num_batches, load_params):
         transition = GatedRecurrent(name="transition", dim=dim,
                                     activation=Tanh())
         generator = SequenceGenerator(
-            Readout(readout_dim=vocab_size, source_names=["states"],
+            Readout(readout_dim=vocab_size, source_names=transition.apply.states,
                     emitter=SoftmaxEmitter(name="emitter"),
                     feedback_brick=LookupFeedback(
                         vocab_size, feedback_dim, name='feedback'),
                     name="readout"),
             transition,
-            weights_init=IsotropicGaussian(0.01), biases_init=Constant(0),
+            weights_init=Uniform(std=0.04), biases_init=Constant(0),
             name="generator")
         generator.push_initialization_config()
         transition.weights_init = Orthogonal()
+        transition.push_initialization_config()
         generator.initialize()
 
         # Give an idea of what's going on.
@@ -111,8 +119,8 @@ def main(mode, save_path, steps, num_batches, load_params):
         # Build the cost computation graph.
         features = tensor.lmatrix('features')
         features_mask = tensor.matrix('features_mask')
-        batch_cost = generator.cost_matrix(features[:, :],
-                                  mask=features_mask).sum()
+        batch_cost = generator.cost_matrix(
+                features, mask=features_mask).sum()
         cost = aggregation.mean(
             batch_cost,
             features.shape[1])
@@ -120,32 +128,39 @@ def main(mode, save_path, steps, num_batches, load_params):
         char_cost = aggregation.mean(
                 batch_cost, features_mask.sum())
         char_cost.name = 'character_log_likelihood'
-        ppl = 2 ** char_cost
+        ppl = 2 ** (cost / numpy.log(2))
         ppl.name = 'ppl'
         bits_per_char = char_cost / tensor.log(2)
         bits_per_char.name = 'bits_per_char'
         length = features.shape[0]
         length.name = 'length'
 
-        algorithm = GradientDescent(
-            cost=cost,
-            parameters=list(Selector(generator).get_parameters().values()),
-            step_rule=Adam(0.0002))
         train_stream = train_dataset.get_example_stream()
-        #train_stream = Mapping(train_stream, _truncate)
+        train_stream = Mapping(train_stream, _truncate)
         train_stream = Batch(train_stream,
                              iteration_scheme=ConstantScheme(batch_size))
         train_stream = Padding(train_stream)
         train_stream = Mapping(train_stream, _transpose)
+
+        for i, batch in enumerate(train_stream.get_epoch_iterator()):
+            break
+            if i > 58:
+                break
+            print(batch)
+            print("".join([ind_to_char[ind] for ind in batch[0][:, 0]]))
         # ---------------------------------------------------------------------
 
-        valid_stream = valid_dataset.get_example_stream()
-        valid_stream = Batch(valid_stream,
-                             iteration_scheme=ConstantScheme(batch_size))
-        valid_stream = Padding(valid_stream)
-        valid_stream = Mapping(valid_stream, _transpose)
 
-        model = Model(cost)
+        model = Model(batch_cost)
+
+        parameters = model.get_parameter_dict()
+        maxnorm_subjects = VariableFilter(roles=[WEIGHT])(parameters.values())
+        algorithm = GradientDescent(
+            cost=batch_cost,
+            parameters=parameters.values(),
+            step_rule=CompositeRule([StepClipping(1000.), 
+                AdaDelta(epsilon=1e-10) #, Restrict(VariableClipping(1.0, axis=0), maxnorm_subjects)
+                                     ]))
         if load_params:
             params = load_parameter_values(save_path)
             model.set_parameter_values(params)
@@ -153,17 +168,27 @@ def main(mode, save_path, steps, num_batches, load_params):
         ft.name = 'feature_example'
 
         observables = [cost, ppl, char_cost, length, bits_per_char]
+        for name, param in parameters.items():
+            num_elements = numpy.product(param.get_value().shape)
+            norm = param.norm(2) / num_elements ** 0.5
+            grad_norm = algorithm.gradients[param].norm(2) / num_elements ** 0.5
+            step_norm = algorithm.steps[param].norm(2) / num_elements ** 0.5
+            stats = tensor.stack(norm, grad_norm, step_norm, step_norm / grad_norm)
+            stats.name = name + '_stats'
+            observables.append(stats)
         track_the_best_bpc = TrackTheBest('valid_bits_per_char')
         root_path, extension = os.path.splitext(save_path)
 
         this_step_monitoring = TrainingDataMonitoring(
             observables + [ft], prefix="this_step", after_batch=True)
         average_monitoring = TrainingDataMonitoring(
-            observables, prefix="average",
-            every_n_batches=100)
+            observables + [algorithm.total_step_norm,
+                           algorithm.total_gradient_norm], 
+            prefix="average",
+            every_n_batches=10)
         valid_monitoring = DataStreamMonitoring(
             observables, prefix="valid",
-            every_n_batches=1000, before_training=False,
+            every_n_batches=1500, before_training=False,
             data_stream=valid_stream)
         main_loop = MainLoop(
             algorithm=algorithm,
@@ -184,17 +209,19 @@ def main(mode, save_path, steps, num_batches, load_params):
                     OnLogRecord(track_the_best_bpc.notification_name),
                     (root_path + "_best" + extension,)),
                 Timing(after_batch=True),
-                Printing(every_n_batches=100),
+                Printing(every_n_batches=10),
                 Plot(root_path,
                      [[average_monitoring.record_name(cost),
                        valid_monitoring.record_name(cost)],
+                      [average_monitoring.record_name(algorithm.total_step_norm)],
+                      [average_monitoring.record_name(algorithm.total_gradient_norm)],
                       [average_monitoring.record_name(ppl),
                        valid_monitoring.record_name(ppl)],
                       [average_monitoring.record_name(char_cost),
                        valid_monitoring.record_name(char_cost)],
                       [average_monitoring.record_name(bits_per_char),
                        valid_monitoring.record_name(bits_per_char)]],
-                     every_n_batches=100)
+                     every_n_batches=10)
             ])
         main_loop.run()
     elif mode == "sample":
@@ -217,6 +244,16 @@ def main(mode, save_path, steps, num_batches, load_params):
         for a, b in zip(outputs, outputs[1:]):
             trans_freqs[a, b] += 1
         trans_freqs /= trans_freqs.sum(axis=1)[:, None]
+
+    elif mode == 'evaluate':
+        main_loop = load(open(save_path, "rb"))
+        generator = main_loop.model.get_top_bricks()[-1]
+
+        sample = ComputationGraph(generator.generate(
+            n_steps=steps, batch_size=1, iterate=True)).get_theano_function()
+        batch_cost = generator.cost_matrix(
+                features, mask=features_mask).sum()
+        
     else:
         assert False
 
