@@ -35,6 +35,7 @@ from blocks_extras.extensions.plot import Plot
 from blocks.serialization import load, load_parameter_values, continue_training
 from blocks.main_loop import MainLoop
 from blocks.select import Selector
+from blocks.search import BeamSearch
 from fuel.datasets import TextFile
 from fuel.schemes import ConstantScheme, ShuffledScheme
 from fuel.transformers import Batch, Padding, Mapping, Unpack
@@ -130,8 +131,9 @@ def main(mode, save_path, steps, num_batches, load_params):
     # Build the cost computation graph.
     features = tensor.lmatrix('features')
     features_mask = tensor.matrix('features_mask')
-    batch_cost = generator.cost_matrix(
-        features, mask=features_mask).sum()
+    cost_matrix = generator.cost_matrix(
+        features, mask=features_mask)
+    batch_cost = cost_matrix.sum()
     cost = aggregation.mean(
         batch_cost,
         features.shape[1])
@@ -236,11 +238,27 @@ def main(mode, save_path, steps, num_batches, load_params):
         main_loop.run()
 
     elif mode == 'evaluate':
-        words = []
-        compute_cost = theano.function([features, features_mask], batch_cost)
+        with open('/data/lisatmp3/serdyuk/wsj_lms/lms/wsj_trigram_with_initial_eos/words.txt') as f:
+            words = [line.split()[0] for line in f.readlines()]
+            words = [[char_to_ind[c] if c in char_to_ind else char_to_ind['<UNK>'] for c in w] for w in words]
+        max_word_length = max([len(w) for w in words])
+        #compute_cost = theano.function([features, features_mask], cost_matrix.sum(axis=0))
+
+        states, sample, costs = generator.generate(
+            n_steps=steps, iterate=True)
+        beam_search = BeamSearch(len(words), sample)
+        beam_search.compile()
 
         total_word_cost = 0
         num_words = 0
+        examples = numpy.zeros((max_word_length, len(words)),
+                               dtype='int64')
+        mask = numpy.zeros((max_word_length, len(words)),
+                           dtype=floatX)
+
+        for i, word in enumerate(words):
+            examples[:len(word), i] = word
+            mask[:len(word), i] = 1.
         for batch in valid_stream.get_epoch_iterator():
             for example, mask in equizip(batch[0].T, batch[1].T):
                 example = example[:(mask.sum())]
@@ -254,11 +272,9 @@ def main(mode, save_path, steps, num_batches, load_params):
                     cost_with = compute_cost(example[:j, None], 
                                                 numpy.ones_like(example[:j, None], dtype=floatX))
                     costs = []
-                    for word in words:
-                        new_example = numpy.concatenate([example[:i], word])[:, None]
-                        costs.append(numpy.exp(-compute_cost(
-                            new_example, 
-                            numpy.ones_like(new_example, dtype=floatX))))
+                    import ipdb;ipdb.set_trace()
+                    costs = numpy.exp(-compute_cost(
+                        examples, mask))
                     word_prob = numpy.exp(-(cost_with - cost_without))
                     total_word_cost += numpy.log(word_prob / numpy.sum(costs))
                     num_words += 1
