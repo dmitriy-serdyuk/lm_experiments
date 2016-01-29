@@ -245,7 +245,8 @@ def main(mode, save_path, steps, num_batches, load_params):
         max_word_length = max([len(w) for w in words])
         
         initial_states = tensor.matrix('init_states')
-        cost_matrix_step = generator.cost_matrix(features, mask=features_mask, states=initial_states)
+        cost_matrix_step = generator.cost_matrix(features, mask=features_mask,
+                                                 states=initial_states)
         cg = ComputationGraph(cost_matrix_step)
         states = cg.auxiliary_variables[-2]
         compute_cost = theano.function([features, features_mask, initial_states], 
@@ -254,8 +255,6 @@ def main(mode, save_path, steps, num_batches, load_params):
         cost_matrix = generator.cost_matrix(features, mask=features_mask)
         initial_cg = ComputationGraph(cost_matrix)
         initial_states = initial_cg.auxiliary_variables[-2]
-        compute_initial_cost = theano.function([features, features_mask],
-                                               [cost_matrix.sum(axis=0), initial_states])
 
         total_word_cost = 0
         num_words = 0
@@ -268,13 +267,13 @@ def main(mode, save_path, steps, num_batches, load_params):
             examples[:len(word), i] = word
             all_masks[:len(word), i] = 1.
 
-        single_space = numpy.array(char_to_ind[' '])[:, None]
+        single_space = numpy.array([char_to_ind[' ']])[:, None]
 
         for batch in valid_stream.get_epoch_iterator():
             for example, mask in equizip(batch[0].T, batch[1].T):
                 example = example[:(mask.sum())]
                 spc_inds = list(numpy.where(example == char_to_ind[" "])[0])
-                state = generator.transition.transition.initial_states_.get_value()
+                state = generator.transition.transition.initial_states_.get_value()[None, :]
                 for i, j in equizip([-1] + spc_inds, spc_inds + [-1]):
                     word = example[(i+1):j, None]
                     word_cost, states = compute_cost(
