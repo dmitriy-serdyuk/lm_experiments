@@ -102,7 +102,7 @@ def main(mode, save_path, steps, num_batches, load_params):
     # Experiment configuration
     batch_size = 20
     dim = 650
-    feedback_dim = 700
+    feedback_dim = 650
 
     valid_stream = valid_dataset.get_example_stream()
     valid_stream = Batch(valid_stream,
@@ -238,47 +238,65 @@ def main(mode, save_path, steps, num_batches, load_params):
         main_loop.run()
 
     elif mode == 'evaluate':
-        with open('/data/lisatmp3/serdyuk/wsj_lms/lms/wsj_trigram_with_initial_eos/words.txt') as f:
-            words = [line.split()[0] for line in f.readlines()]
-            words = [[char_to_ind[c] if c in char_to_ind else char_to_ind['<UNK>'] for c in w] for w in words]
+        with open('/data/lisatmp3/serdyuk/wsj_lms/lms/wsj_trigram_with_initial_eos/lexicon.txt') as f:
+            raw_words = [line.split()[1:-1] for line in f.readlines()]
+            words = [[char_to_ind[c] if c in char_to_ind else char_to_ind['<UNK>'] for c in w] 
+                     for w in raw_words]
         max_word_length = max([len(w) for w in words])
-        #compute_cost = theano.function([features, features_mask], cost_matrix.sum(axis=0))
+        
+        initial_states = tensor.matrix('init_states')
+        cost_matrix_step = generator.cost_matrix(features, mask=features_mask, states=initial_states)
+        cg = ComputationGraph(cost_matrix_step)
+        states = cg.auxiliary_variables[-2]
+        compute_cost = theano.function([features, features_mask, initial_states], 
+                                       [cost_matrix_step.sum(axis=0), states])
 
-        states, sample, costs = generator.generate(
-            n_steps=steps, iterate=True)
-        beam_search = BeamSearch(len(words), sample)
-        beam_search.compile()
+        cost_matrix = generator.cost_matrix(features, mask=features_mask)
+        initial_cg = ComputationGraph(cost_matrix)
+        initial_states = initial_cg.auxiliary_variables[-2]
+        compute_initial_cost = theano.function([features, features_mask],
+                                               [cost_matrix.sum(axis=0), initial_states])
 
         total_word_cost = 0
         num_words = 0
-        examples = numpy.zeros((max_word_length, len(words)),
+        examples = numpy.zeros((max_word_length + 1, len(words)),
                                dtype='int64')
-        mask = numpy.zeros((max_word_length, len(words)),
+        all_masks = numpy.zeros((max_word_length + 1, len(words)),
                            dtype=floatX)
 
         for i, word in enumerate(words):
             examples[:len(word), i] = word
-            mask[:len(word), i] = 1.
+            all_masks[:len(word), i] = 1.
         for batch in valid_stream.get_epoch_iterator():
             for example, mask in equizip(batch[0].T, batch[1].T):
                 example = example[:(mask.sum())]
                 spc_inds = list(numpy.where(example == char_to_ind[" "])[0])
-                for i, j in equizip([0] + spc_inds, spc_inds + [-1]):
+                for i, j in equizip([-1] + spc_inds, spc_inds + [-1]):
+                    word = example[(i+1):j, None]
+                    prefix = example[:(i+1), None]
                     if i > 0:
-                        cost_without = compute_cost(example[:i, None], 
-                                                    numpy.ones_like(example[:i, None], dtype=floatX))
+                        cost_without, states = compute_initial_cost(
+                            prefix, numpy.ones_like(prefix, dtype=floatX))
+                        state = states[-1]
+                        cost_with, _ = compute_cost(
+                            word, numpy.ones_like(word, dtype=floatX), state)
                     else:
                         cost_without = 0
-                    cost_with = compute_cost(example[:j, None], 
-                                                numpy.ones_like(example[:j, None], dtype=floatX))
+                        cost_with, init_states = compute_initial_cost(
+                            word, numpy.ones_like(word, dtype=floatX))
+                        
+                        state = generator.transition.transition.initial_states_.get_value()
                     costs = []
-                    import ipdb;ipdb.set_trace()
                     costs = numpy.exp(-compute_cost(
-                        examples, mask))
+                        examples, all_masks, numpy.tile(state, [examples.shape[1], 1]))[0])
+
                     word_prob = numpy.exp(-(cost_with - cost_without))
-                    total_word_cost += numpy.log(word_prob / numpy.sum(costs))
+                    total_word_cost += (cost_with - cost_without) + numpy.log(numpy.sum(costs))
                     num_words += 1
                     print(word_prob)
+                    print(numpy.sum(costs))
+                    print("Average cost", total_word_cost / num_words)
+                    print("PPL", numpy.exp(total_word_cost / num_words))
 
         print("Word-level perplexity")
         print(total_word_cost / num_words)
