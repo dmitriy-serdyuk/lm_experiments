@@ -262,36 +262,34 @@ def main(mode, save_path, steps, num_batches, load_params):
         examples = numpy.zeros((max_word_length + 1, len(words)),
                                dtype='int64')
         all_masks = numpy.zeros((max_word_length + 1, len(words)),
-                           dtype=floatX)
+                                dtype=floatX)
 
         for i, word in enumerate(words):
             examples[:len(word), i] = word
             all_masks[:len(word), i] = 1.
+
+        single_space = numpy.array(char_to_ind[' '])[:, None]
+
         for batch in valid_stream.get_epoch_iterator():
             for example, mask in equizip(batch[0].T, batch[1].T):
                 example = example[:(mask.sum())]
                 spc_inds = list(numpy.where(example == char_to_ind[" "])[0])
+                state = generator.transition.transition.initial_states_.get_value()
                 for i, j in equizip([-1] + spc_inds, spc_inds + [-1]):
                     word = example[(i+1):j, None]
-                    prefix = example[:(i+1), None]
-                    if i > 0:
-                        cost_without, states = compute_initial_cost(
-                            prefix, numpy.ones_like(prefix, dtype=floatX))
-                        state = states[-1]
-                        cost_with, _ = compute_cost(
-                            word, numpy.ones_like(word, dtype=floatX), state)
-                    else:
-                        cost_without = 0
-                        cost_with, init_states = compute_initial_cost(
-                            word, numpy.ones_like(word, dtype=floatX))
-                        
-                        state = generator.transition.transition.initial_states_.get_value()
-                    costs = []
+                    word_cost, states = compute_cost(
+                        word, numpy.ones_like(word, dtype=floatX), state)
+                    state = states[-1]
+
                     costs = numpy.exp(-compute_cost(
                         examples, all_masks, numpy.tile(state, [examples.shape[1], 1]))[0])
 
-                    word_prob = numpy.exp(-(cost_with - cost_without))
-                    total_word_cost += (cost_with - cost_without) + numpy.log(numpy.sum(costs))
+                    _, space_states = compute_cost(
+                        single_space, numpy.ones_like(single_space, dtype=floatX), state)
+                    state = space_states[-1]
+
+                    word_prob = numpy.exp(-word_cost)
+                    total_word_cost += word_cost + numpy.log(numpy.sum(costs))
                     num_words += 1
                     print(word_prob)
                     print(numpy.sum(costs))
